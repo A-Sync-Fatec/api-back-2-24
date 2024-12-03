@@ -49,7 +49,7 @@ public class ProjetoService {
         return projetoRepository.findById(id)
                 .orElseThrow(() -> new RuntimeException("Projeto não encontrado."));
     }
-    
+
     public Projeto buscarProjetoPorReferencia(String referenciaProjeto) {
         return projetoRepository.findByReferenciaProjeto(referenciaProjeto);
     }
@@ -206,15 +206,23 @@ public class ProjetoService {
         projetoExistente.setDataInicio(projetoDto.getDataInicio());
         projetoExistente.setDataTermino(projetoDto.getDataTermino());
 
-        // Verificar situação do projeto
+        // Atualizar situação do projeto
         String situacao = projetoDto.getDataTermino().isAfter(LocalDate.now()) ? "Em Andamento" : "Encerrado";
         projetoExistente.setSituacao(situacao);
 
-        // Desativar arquivos se necessário
+        // Lista de IDs de arquivos desativados
+        String arquivosDesativadosJson = null;
         if (arquivosExcluidos != null && !arquivosExcluidos.isEmpty()) {
+            List<Long> idsDesativados = new ArrayList<>();
             for (Long arquivoId : arquivosExcluidos) {
-                arquivoService.desativarArquivo(arquivoId); // Exclusão lógica
+                Arquivo arquivo = arquivoRepository.findById(arquivoId)
+                        .orElseThrow(() -> new RuntimeException("Arquivo não encontrado com ID: " + arquivoId));
+                arquivo.setProjeto(null); // Desvincula o projeto
+                arquivo.setAprovado(false); // Marca como inativo
+                arquivoRepository.save(arquivo); // Atualiza o estado no banco
+                idsDesativados.add(arquivoId); // Adiciona o ID à lista
             }
+            arquivosDesativadosJson = objectMapper.writeValueAsString(idsDesativados); // Serializa IDs desativados
         }
 
         // Adicionar novos arquivos
@@ -228,50 +236,100 @@ public class ProjetoService {
             arquivoService.salvarArquivo(artigos, projetoExistente, "Artigos", true);
         }
 
+        // Cadastrar histórico da edição
+        String dadosProjeto = "{}";
+        try {
+            dadosProjeto = objectMapper.writeValueAsString(projetoExistente);
+        } catch (Exception e) {
+            throw new RuntimeException("Erro ao serializar os dados do projeto para o histórico: " + e.getMessage());
+        }
+
+        historicoService.cadastrarHistorico(
+                projetoDto.getAdm(), // ID do administrador responsável
+                "edicao",           // Tipo de alteração
+                "projeto",          // Tipo do alvo
+                projetoExistente.getId(), // ID do projeto alterado
+                dadosProjeto,       // Dados do projeto atualizado
+                arquivosDesativadosJson // Apenas os IDs dos arquivos excluídos
+        );
+
+        // Retorna o projeto atualizado
         return projetoRepository.save(projetoExistente);
     }
-
 
 
 
     // Método para excluir um projeto e seus arquivos associados
     @Transactional
     public void excluirProjeto(Long id, Long admAlterador) {
-        // Buscar o projeto
+        // Busca o projeto pelo ID
         Projeto projeto = buscarProjetoPorId(id);
 
-        // Atualizar o status do projeto (ou outro campo que indique exclusão lógica)
-        projeto.setSituacao("Desativado");
-        projetoRepository.save(projeto);
-
-        // Atualizar os arquivos relacionados para "desativados"
-        List<Arquivo> arquivos = arquivoRepository.findByProjetoId(projeto.getId());
-        if (!arquivos.isEmpty()) {
-            arquivos.forEach(arquivo -> arquivo.setAprovado(false)); // Marca os arquivos como não aprovados
-            arquivoRepository.saveAll(arquivos); // Salva as alterações no banco
+        // Serializa os dados do projeto antes de excluir
+        String dadosProjeto = "{}";
+        try {
+            dadosProjeto = objectMapper.writeValueAsString(projeto);
+        } catch (Exception e) {
+            throw new RuntimeException("Erro ao serializar os dados do projeto para o histórico: " + e.getMessage());
         }
 
-        // Registrar no histórico a desativação do projeto
+        // Recupera os arquivos associados ao projeto
+        List<Arquivo> arquivos = arquivoRepository.findByProjetoId(projeto.getId());
+        String arquivosJson = "[]";
+        if (arquivos != null && !arquivos.isEmpty()) {
+            try {
+                // Extrai apenas os IDs dos arquivos
+                List<Long> arquivoIds = arquivos.stream()
+                        .map(Arquivo::getId) // Extrai o ID de cada Arquivo
+                        .collect(Collectors.toList());
+                // Serializa apenas os IDs
+                arquivosJson = objectMapper.writeValueAsString(arquivoIds);
+            } catch (Exception e) {
+                throw new RuntimeException("Erro ao serializar os IDs dos arquivos do projeto para o histórico: " + e.getMessage());
+            }
+        }
+
+        // Registra o histórico da exclusão
         historicoService.cadastrarHistorico(
                 admAlterador,
-                "desativacao",
+                "delecao",
                 "projeto",
                 projeto.getId(),
-                null,
-                null
+                dadosProjeto,
+                arquivosJson
         );
+
+        // Desativa os arquivos relacionados ao projeto (exclusão lógica)
+        if (!arquivos.isEmpty()) {
+            for (Arquivo arquivo : arquivos) {
+                arquivo.setProjeto(null); // Desassocia o projeto do arquivo
+                arquivo.setAprovado(false); // Marca como inativo
+                arquivoRepository.save(arquivo); // Atualiza o estado no banco
+            }
+        }
+
+        // Remove permissões relacionadas ao projeto
+        List<Permissao> permissoes = permissaoRepository.findByProjetoId(projeto.getId());
+        if (!permissoes.isEmpty()) {
+            permissaoRepository.deleteAll(permissoes);
+        }
+
+        // Exclui o projeto
+        projetoRepository.delete(projeto);
     }
+
+
 
 
     public String calcularProximaReferencia() {
         int anoAtual = LocalDate.now().getYear() % 100;
         List<Integer> numerosUtilizados = projetoRepository.findAll()
-            .stream()
-            .map(Projeto::getReferenciaProjeto)
-            .filter(ref -> ref.endsWith("/" + anoAtual))
-            .map(ref -> Integer.parseInt(ref.split("/")[0]))
-            .sorted()
-            .toList();
+                .stream()
+                .map(Projeto::getReferenciaProjeto)
+                .filter(ref -> ref.endsWith("/" + anoAtual))
+                .map(ref -> Integer.parseInt(ref.split("/")[0]))
+                .sorted()
+                .toList();
 
         for (int i = 1; i <= 999; i++) {
             if (!numerosUtilizados.contains(i)) {
